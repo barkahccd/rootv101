@@ -3398,8 +3398,8 @@ function isTrafficCongestionError(error) {
 // ============================================================================
 const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
 const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
-const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
-const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
+const TWOCAPTCHA_IN_URL = "https://api.multibot.cloud/in.php";
+const TWOCAPTCHA_RES_URL = "https://api.multibot.cloud/res.php";
 const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
 const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
 const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
