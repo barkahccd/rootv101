@@ -26,48 +26,6 @@ const DEFAULT_CONFIG_FILE = "config.json";
 const DEFAULT_ACCOUNTS_FILE = "accounts.json";
 const DEFAULT_TOKENS_FILE = "tokens.json";
 const DEFAULT_PROXY_FILE = "proxy.txt";
-const TX_STATE_FILE = "tx_hourly_state.json";
-
-// ── Global ANSI color palette ─────────────────────────────────────────────────
-const C = {
-  reset:   "\x1b[0m",
-  bold:    "\x1b[1m",
-  dim:     "\x1b[2m",
-  green:   "\x1b[32m",
-  cyan:    "\x1b[36m",
-  yellow:  "\x1b[33m",
-  red:     "\x1b[31m",
-  magenta: "\x1b[35m",
-  white:   "\x1b[97m",
-  gray:    "\x1b[90m",
-  amber:   "\x1b[38;5;214m",
-};
-
-// ── Score label helper ────────────────────────────────────────────────────────
-function getScoreLabel(score) {
-  if (score >= 85) return "High";
-  if (score >= 75) return "Strong";
-  if (score >= 60) return "Medium";
-  return "Low";
-}
-
-// ── Score color helper ────────────────────────────────────────────────────────
-function colorScore(score) {
-  if (score >= 85) return C.green;
-  if (score >= 75) return C.cyan;
-  if (score >= 60) return C.yellow;
-  return C.red;
-}
-
-// ── Tier color helper ─────────────────────────────────────────────────────────
-function colorTier(tier) {
-  const t = String(tier || "").toUpperCase();
-  if (t === "ELITE")  return C.magenta;
-  if (t === "HIGH")   return C.green;
-  if (t === "STRONG") return C.cyan;
-  if (t === "NEWBIE") return C.gray;
-  return C.reset;
-}
 
 // Proxy support: per-account proxy mapping (account name -> proxy URL)
 const proxyByAccount = new Map();
@@ -127,9 +85,6 @@ function killZombieBrowsers() {
 
 // Run zombie cleanup every 2 minutes
 setInterval(killZombieBrowsers, 120000).unref();
-
-// Auto-save TX hourly state every 30 seconds (fail-safe)
-setInterval(() => { saveTxHourlyState().catch(() => {}); }, 30000).unref();
 
 // Also clean up on exit
 process.on("exit", killZombieBrowsers);
@@ -307,31 +262,6 @@ function getHourlyResetWaitMs(accountName) {
   const firstTx = list[0];
   const waitMs = firstTx + HOURLY_TX_WINDOW_MS + HOURLY_TX_BUFFER_MS - Date.now();
   return Math.max(0, waitMs);
-}
-
-async function saveTxHourlyState() {
-  try {
-    const data = {};
-    for (const [name, timestamps] of txTimestampsByAccount.entries()) {
-      data[name] = timestamps;
-    }
-    await fs.writeFile(TX_STATE_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.log("[tx-state] save error:", err.message);
-  }
-}
-
-async function loadTxHourlyState() {
-  try {
-    const text = await fs.readFile(TX_STATE_FILE, "utf8");
-    const data = JSON.parse(text);
-    for (const [name, timestamps] of Object.entries(data)) {
-      txTimestampsByAccount.set(name, timestamps);
-    }
-    console.log("[tx-state] loaded previous TX state");
-  } catch {
-    console.log("[tx-state] no previous TX state");
-  }
 }
 
 // key: "sender=>recipient", value: timestamp (ms) of successful send
@@ -954,23 +884,12 @@ function pickSmartRecipient(senderName, sortedAccounts) {
     return null;
   }
 
-  // Dynamic distribution
-  const distribution = computeBalanceDistribution(
-    sortedAccounts.map(a => a.name)
-  );
-
-  const avg = distribution.averageCc || 0;
-
-  const MIN_BALANCE = avg * 0.7;
-  const TARGET_BALANCE = avg;
-  const MAX_BALANCE = avg * 1.4;
-
   const candidates = [];
   for (const account of sortedAccounts) {
-    const name = String(account?.name || "").trim();
+    const name = String(account && account.name ? account.name : "").trim();
     if (!name || name === senderName) continue;
-    if (!String(account?.address || "").trim()) continue;
-
+    if (!String(account.address || "").trim()) continue;
+    // Skip if already targeted this round (no double-inbound)
     if (isRecipientClaimed(name)) continue;
     if (isReciprocalPairInCooldown(senderName, name)) continue;
 
@@ -978,59 +897,26 @@ function pickSmartRecipient(senderName, sortedAccounts) {
     if (!Number.isFinite(cc)) continue;
 
     const tierMin = getAccountTierMinSend(name);
-
-    const canSend = cc >= tierMin;
+    const deficit = tierMin - cc;
     const txStats = getPerAccountTxStats(name);
-    const txTotal = txStats?.total || 0;
-
-    const deficit = TARGET_BALANCE - cc;
-    const isCritical = cc < MIN_BALANCE;
-
-    // 🔥 PRESSURE (core balancing signal)
-    let pressure = deficit / (TARGET_BALANCE || 1);
-
-    // 🔥 WEIGHTED DRAIN (no extra TX)
-    // Accounts above MAX get additional pressure boost
-    if (cc > MAX_BALANCE) {
-      const excess = (cc - MAX_BALANCE) / (TARGET_BALANCE || 1);
-      pressure += 0.5 + excess; // boost priority without adding TX
-    }
-
-    candidates.push({
-      account,
-      name,
-      cc,
-      canSend,
-      txTotal,
-      isCritical,
-      pressure
-    });
+    const txTotal = clampToNonNegativeInt(txStats && txStats.total, 0);
+    candidates.push({ account, name, cc, tierMin, deficit, txTotal });
   }
 
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) {
+    return null;
+  }
 
+  // Priority order:
+  //   1. Lowest TX progress first (close the gap between accounts)
+  //   2. Accounts that cannot currently send (deficit > 0) — biggest deficit first
+  //   3. Lowest CC balance overall (final tiebreak)
   candidates.sort((a, b) => {
-    // 1. CRITICAL first
-    if (a.isCritical !== b.isCritical) {
-      return a.isCritical ? -1 : 1;
-    }
-
-    // 2. Cannot send → unblock
-    if (a.canSend !== b.canSend) {
-      return a.canSend ? 1 : -1;
-    }
-
-    // 3. Highest pressure (includes weighted drain)
-    if (a.pressure !== b.pressure) {
-      return b.pressure - a.pressure;
-    }
-
-    // 4. Fewer TX first
-    if (a.txTotal !== b.txTotal) {
-      return a.txTotal - b.txTotal;
-    }
-
-    // 5. Lower balance fallback
+    if (a.txTotal !== b.txTotal) return a.txTotal - b.txTotal;
+    const aNeedy = a.deficit > 0 ? 1 : 0;
+    const bNeedy = b.deficit > 0 ? 1 : 0;
+    if (aNeedy !== bNeedy) return bNeedy - aNeedy;
+    if (aNeedy === 1) return b.deficit - a.deficit;
     return a.cc - b.cc;
   });
 
@@ -1404,310 +1290,117 @@ class PinnedDashboard {
       return;
     }
 
-    // ── ANSI helpers (reference global C palette) ─────────────────────────────
-    const clr  = (code, text) => `${code}${text}${C.reset}`;
-    const bold = (text)        => `${C.bold}${text}${C.reset}`;
-
-    // Strip ANSI codes to get the visible length of a string
-    const visibleLen = (str) => String(str || "").replace(/\x1b\[[0-9;]*m/g, "").length;
-
-    // Pad a potentially ANSI-coloured string to a fixed visible width
-    const padVis = (str, width, char = " ") => {
-      const vl = visibleLen(str);
-      const pad = Math.max(0, width - vl);
-      return `${str}${char.repeat(pad)}`;
-    };
-
-    // Clip visible text (ignoring ANSI) to maxLen, then pad
-    const clipPad = (str, width) => {
-      const plain = String(str || "-");
-      const clipped = visibleLen(plain) > width
-        ? plain.replace(/\x1b\[[0-9;]*m/g, "").slice(0, Math.max(0, width - 1)) + "…"
-        : plain;
-      return padVis(clipped, width);
-    };
-
-    // ── Layout ────────────────────────────────────────────────────────────────
-    const terminalWidth = Number(process.stdout.columns || 140);
-    const frameWidth    = Math.max(150, Math.min(220, terminalWidth));
-    const innerWidth    = frameWidth - 2; // inside ╔…╗
-
-    // Box-drawing borders
-    const topBorder  = `╔${"═".repeat(innerWidth)}╗`;
-    const midBorder  = `╠${"═".repeat(innerWidth)}╣`;
-    const rowSep     = `╟${"─".repeat(innerWidth)}╢`;
-    const botBorder  = `╚${"═".repeat(innerWidth)}╝`;
-
-    // A full-width banner line (pads/clips to innerWidth - 2 for one space each side)
-    const bline = (text) => {
-      const contentW = innerWidth - 2;
-      const padded   = padVis(text, contentW);
-      const clippedV = visibleLen(padded) > contentW
-        ? padded.slice(0, contentW)
-        : padded;
-      return `║ ${clippedV} ║`;
-    };
-
-    // ── Time / mode ───────────────────────────────────────────────────────────
     const now = new Date().toLocaleString("id-ID", {
       hour12: false,
       timeZone: "Asia/Jakarta"
     });
-    const rows        = this.parseAccountRows();
+    const rows = this.parseAccountRows();
     const accountCount = rows.length;
-    const modeLabel   = String(this.state.mode || "-").toUpperCase();
+    const terminalWidth = Number(process.stdout.columns || 132);
+    const frameWidth = Math.max(142, Math.min(210, terminalWidth));
+    const contentWidth = frameWidth - 4;
+    const modeLabel = String(this.state.mode || "-").toUpperCase();
+    const topBorder = `+${"=".repeat(frameWidth - 2)}+`;
+    const midBorder = `+${"-".repeat(frameWidth - 2)}+`;
+    const bannerLine = (text) => `| ${this.formatCell(text, contentWidth)} |`;
 
-    // ── Global TX stats ───────────────────────────────────────────────────────
-    const txTotal = this.state.swapsTotal || 0;
-    const txOk    = this.state.swapsOk    || 0;
-    const txFail  = this.state.swapsFail  || 0;
-
-    // ── Reward totals ─────────────────────────────────────────────────────────
-    const rewardsTotals    = getTotalRewardsThisWeek();
-    const rewardsDiffTotals = getTotalRewardsDiff();
-
-    // Weekly CC / USD
-    const weekCC  = rewardsTotals.cc.toFixed(2);
-    const weekUSD = rewardsTotals.usd.toFixed(2);
-
-    // Today / session earnings  (rewardsDiff = change since session start)
-    const sessCC  = rewardsDiffTotals.cc;
-    const sessUSD = rewardsDiffTotals.usd;
-    const todayCC  = `${sessCC  >= 0 ? "+" : ""}${sessCC.toFixed(2)}`;
-    const todayUSD = `${sessUSD >= 0 ? "+" : ""}$${sessUSD.toFixed(2)}`;
-
-    // Profitability
-    const profitInfo = lastProfitabilityStatus;
-    const profitPct  = profitInfo ? `${profitInfo.currentRecoveryPercent}%` : "-";
-    const profitMode = profitInfo ? String(profitInfo.modeLabel || "").toUpperCase() : "-";
-    const isGreen    = profitInfo && profitInfo.currentRecoveryPercent >= 80;
-    const profitColor = isGreen ? C.green : C.amber;
-    const profitTag   = isGreen ? "GREEN" : "AMBER";
-
-    // Uptime
-    const uptimeLabel = getGlobalUptimeLabel() || "-";
-
-    // ── Table column widths (9 columns) ────────────────────────────────────────
-    // Akun | State | CC | TX/hr | Send Plan | Score | Tier | Rewards/Week | Diff Reward
-    const COL = {
-      akun:    14,
-      state:    9,
-      cc:      10,
-      txhr:    12,
-      score:   14,
-      tier:    10,
-      rwWeek:  20,
-      rwDiff:  20,
+    // Dynamic table: 8 columns, auto-resize based on terminal width
+    const fixedCols = {
+      akun: 14,
+      status: 9,
+      cc: 10,
+      txProgress: 20,
+      rewardsWeek: 22,
+      rewardsDiff: 22,
     };
-    const NUM_COLS = 9;
-    const separators = 3 * (NUM_COLS - 1); // " | " between each column
-    const fixedSum = COL.akun + COL.state + COL.cc + COL.txhr + COL.score + COL.tier + COL.rwWeek + COL.rwDiff;
-    const contentW = innerWidth - 4; // "| " and " |" brackets
-    const sendPlanW = Math.max(14, contentW - separators - fixedSum);
-    COL.sendPlan = sendPlanW;
+    const columnCount = 8;
+    const separatorWidth = 3 * (columnCount - 1); // " | " between columns
+    const fixedTotal = fixedCols.akun + fixedCols.status + fixedCols.cc + fixedCols.txProgress + fixedCols.rewardsWeek + fixedCols.rewardsDiff;
+    const flexTotal = Math.max(40, contentWidth - separatorWidth - fixedTotal);
+    // Distribute flex space: Send Plan 55%, Score 45%
+    const sendPlanWidth = Math.max(16, Math.floor(flexTotal * 0.55));
+    const scoreWidth = Math.max(22, flexTotal - sendPlanWidth);
+    const tableWidths = [fixedCols.akun, fixedCols.status, fixedCols.cc, fixedCols.txProgress, sendPlanWidth, scoreWidth, fixedCols.rewardsWeek, fixedCols.rewardsDiff];
+    const tableRow = (cells) => `| ${cells.map((cell, idx) => this.formatCell(String(cell || "-"), tableWidths[idx] || 10)).join(" | ")} |`;
+    const tableRule = (char) => `| ${tableWidths.map((width) => char.repeat(width)).join(" | ")} |`;
 
-    // Column order array for tableRow()
-    const colWidths = [COL.akun, COL.state, COL.cc, COL.txhr, COL.sendPlan, COL.score, COL.tier, COL.rwWeek, COL.rwDiff];
-
-    const tableRow = (cells, colors = []) => {
-      const rendered = cells.map((cell, i) => {
-        const w   = colWidths[i] || 10;
-        const col = colors[i] || "";
-        const txt = col ? clr(col, clipPad(String(cell || "-"), w)) : clipPad(String(cell || "-"), w);
-        return txt;
-      });
-      return `║ ${rendered.join(" │ ")} ║`;
-    };
-
-    const tableRule = (char = "─") =>
-      `╟ ${colWidths.map((w) => char.repeat(w)).join("─┼─")} ╢`;
-
-    // ── State label mapping ───────────────────────────────────────────────────
-    const stateMap = (raw) => {
-      const key = String(raw || "").toLowerCase();
-      const map = {
-        idle:        "READY",
-        ready:       "READY",
-        send:        "SEND",
-        cooldown:    "COOLDOWN",
-        captcha:     "CAPTCHA",
-        "dry-run":   "DRY-RUN",
-        sync:        "SYNC",
-        security:    "SECURITY",
-        session:     "SESSION",
-        "otp-wait":  "OTP-WAIT",
-        finalize:    "FINALIZE",
-        limit:       "LIMIT",
-      };
-      return map[key] || String(raw || "-").toUpperCase();
-    };
-
-    const stateColor = (st) => {
-      const map = {
-        "READY":    C.green,
-        "SEND":     C.cyan,
-        "COOLDOWN": C.yellow,
-        "LIMIT":    C.red,
-        "CAPTCHA":  C.magenta,
-        "DRY-RUN":  C.dim,
-      };
-      return map[st] || C.white;
-    };
-
-    // ── TX/hr formatter ───────────────────────────────────────────────────────
-    const formatTxHr = (accountName, accountStats) => {
-      const ok   = accountStats.ok   || 0;
-      const fail = accountStats.fail || 0;
-      const hr   = getHourlyTxCount(accountName);
-      const cap  = HOURLY_MAX_TX_PER_ACCOUNT;
-      const used = hr;
-      const okStr   = `${C.green}✔${ok}${C.reset}`;
-      const failStr = `${C.red}✖${fail}${C.reset}`;
-      let txStr = `${used}/${cap} ${okStr} ${failStr}`;
-      if (used >= cap) {
-        txStr = `${C.red}${used}/${cap} ⛔${C.reset}`;
-      }
-      return txStr;
-    };
-
-    // ── Diff Reward formatter with colour ─────────────────────────────────────
-    const formatDiffColoured = (diffStr) => {
-      const s = String(diffStr || "-");
-      if (s === "-") return s;
-      const isPositive = s.startsWith("+") || (!s.startsWith("-") && parseFloat(s) > 0);
-      const isNegative = s.startsWith("-");
-      if (isPositive) return clr(C.green, s);
-      if (isNegative) return clr(C.red, s);
-      return s;
-    };
-
-    // ── Build output lines ────────────────────────────────────────────────────
     const lines = [];
-
     lines.push(topBorder);
-
-    // Row 1: Title | Time | Accounts | Mode
-    lines.push(bline(
-      `${bold(clr(C.cyan, "ROOTSFI AUTO-SEND V2"))}  │  ${clr(C.white, now)} WIB  │  ${clr(C.yellow, String(accountCount))} akun  │  Mode: ${clr(C.cyan, modeLabel)}  │  Uptime: ${clr(C.dim, uptimeLabel)}`
-    ));
-
-    // Row 2: TX stats
-    lines.push(bline(
-      `TX: ${clr(C.white, String(txTotal))} total  │  ${clr(C.green, "OK: " + txOk)}  │  ${clr(C.red, "FAIL: " + txFail)}  │  CAP: ${HOURLY_MAX_TX_PER_ACCOUNT}/hr`
-    ));
-
-    // Row 3: Total reward
-    lines.push(bline(
-      `TOTAL REWARD: ${clr(C.green, weekCC + " CC")} (${clr(C.green, "$" + weekUSD)})`
-    ));
-
-    // Row 4: Today + Week earnings
-    const todayColor = sessCC >= 0 ? C.green : C.red;
-    lines.push(bline(
-      `TODAY: ${clr(todayColor, todayCC + " CC")} (${clr(todayColor, todayUSD)})  │  WEEK: ${clr(C.green, weekCC + " CC")} ($${weekUSD})`
-    ));
-
-    // Row 5: Profitability
-    lines.push(bline(
-      `PROFITABILITY: ${clr(profitColor, profitPct)}  (${clr(profitColor, profitTag)})  │  ${clr(C.dim, `State: ${this.state.phase}`)}`
-    ));
-
+    lines.push(
+      bannerLine(
+        `RootFiBot Auto-Send V1  |  ${now} WIB  |  ${accountCount} akun  |  Mode: ${modeLabel}`
+      )
+    );
+    lines.push(
+      bannerLine(
+        `Sends: ${this.state.swapsTotal} total  ${this.state.swapsOk} ok  ${this.state.swapsFail} fail  |  Target: ${this.state.targetPerDay}/day`
+      )
+    );
+    const rewardsTotals = getTotalRewardsThisWeek();
+    lines.push(
+      bannerLine(
+        `Rewards this week (all accounts): ${rewardsTotals.cc.toFixed(2)} CC  |  $${rewardsTotals.usd.toFixed(2)}`
+      )
+    );
+    const rewardsDiffTotals = getTotalRewardsDiff();
+    lines.push(
+      bannerLine(
+        `Session earnings (all accounts): ${rewardsDiffTotals.cc >= 0 ? "+" : ""}${rewardsDiffTotals.cc.toFixed(2)} CC  |  ${rewardsDiffTotals.usd >= 0 ? "+" : ""}$${rewardsDiffTotals.usd.toFixed(2)}`
+      )
+    );
+    if (String(this.state.mode || "").toLowerCase() === "balance-only") {
+      const initialCcTotal = getTotalInitialCcBalance();
+      lines.push(
+        bannerLine(
+          `Initial balance (all accounts, at login): ${initialCcTotal.toFixed(4)} CC`
+        )
+      );
+    }
+    const uptimeLabel = getGlobalUptimeLabel();
+    lines.push(
+      bannerLine(
+        uptimeLabel
+          ? `State: ${this.state.phase}  |  Uptime: ${uptimeLabel}`
+          : `State: ${this.state.phase}`
+      )
+    );
     lines.push(midBorder);
-
-    // Table header
-    lines.push(tableRow(["Akun", "State", "CC", "TX/hr", "Send Plan", "Score", "Tier", "Rewards/Week", "Diff Reward"]));
-    lines.push(tableRule("─"));
+    lines.push(tableRow(["Akun", "Status", "CC", "TX Progress", "Send Plan", "Score / Tier", "Rewards/Week", "Diff Reward"]));
+    lines.push(tableRule("-"));
 
     if (rows.length === 0) {
-      lines.push(tableRow(["-", "READY", "-", "-", "-", "-", "-", "-", "-"]));
+      lines.push(tableRow(["-", "IDLE", "-", "-", "-", "-", "-", "-"]));
     } else {
       for (const row of rows) {
-        // State
-        const rawStatus  = String(row.status || "IDLE");
-        const stateLabel = stateMap(rawStatus);
-        const stColor    = stateColor(stateLabel);
-
-        // CC
-        const ccLabel = String(row.cc || "-");
-
-        // TX/hr
-        const accountStats = getPerAccountTxStats(row.name);
-        const txHrLabel    = formatTxHr(row.name, accountStats);
-        const txAtCap      = getHourlyTxCount(row.name) >= HOURLY_MAX_TX_PER_ACCOUNT;
-        const txColor      = txAtCap ? C.red : C.cyan;
-
-        // Send Plan
+        const progressLabel = String(row.progress || "-");
         const sendLabel = String(row.send || "-");
-
-        // Score (number + label, coloured)
-        const rawReward = String(row.reward || "-");
-        let scoreNum = "-";
-        if (rawReward !== "-") {
-          const scoreMatch = rawReward.match(/(\d+)/);
-          if (scoreMatch) scoreNum = scoreMatch[1];
-          else scoreNum = rawReward;
-        }
-        const qualScore = getAccountQualityScore(row.name);
-        if (qualScore !== null) scoreNum = String(qualScore);
-        const scoreNumeric = Number(scoreNum);
-        const scoreStr = Number.isFinite(scoreNumeric)
-          ? `${colorScore(scoreNumeric)}${scoreNum}${C.reset} ${C.dim}(${getScoreLabel(scoreNumeric)})${C.reset}`
-          : scoreNum;
-
-        // Tier (label only, uppercased, coloured)
-        const tierRaw   = tierDisplayNameByAccount.get(row.name) || "?";
-        const tierLabel = String(tierRaw).toUpperCase();
-        const tierStr   = `${colorTier(tierLabel)}${tierLabel}${C.reset}`;
-
-        // Rewards/Week
-        const rwWeekLabel = String(row.rewardsThisWeek || "-");
-
-        // Diff Reward (formatted with colour)
-        const rwDiffRaw    = String(row.rewardsDiff || "-");
-        const rwDiffColour = formatDiffColoured(rwDiffRaw);
-
-        lines.push(tableRow(
-          [row.name, stateLabel, ccLabel, txHrLabel, sendLabel, scoreStr, tierStr, rwWeekLabel, rwDiffColour],
-          [C.white,  stColor,    C.white,  "",        C.dim,     "",       "",      C.white,     ""]
-        ));
+        const rewardLabel = String(row.reward || "-");
+        const tierDisplayName = tierDisplayNameByAccount.get(row.name) || "?";
+        const scoreTierLabel = rewardLabel === "-" ? `- / ${tierDisplayName}` : `${rewardLabel} / ${tierDisplayName}`;
+        const rewardsWeekLabel = String(row.rewardsThisWeek || "-");
+        const rewardsDiffLabel = String(row.rewardsDiff || "-");
+        lines.push(tableRow([row.name, row.status, row.cc, progressLabel, sendLabel, scoreTierLabel, rewardsWeekLabel, rewardsDiffLabel]));
       }
     }
 
-    lines.push(rowSep);
-
-    // ── Execution Logs ────────────────────────────────────────────────────────
-    const logHeaderLine = `║ ${clr(C.dim, `── Execution Logs (last ${this.logLines}) `).padEnd(innerWidth - 2 + (clr(C.dim, "").length))} ║`;
-    lines.push(`║ ${padVis(clr(C.dim, `── Execution Logs (last ${this.logLines}) ──`), innerWidth - 2)} ║`);
+    lines.push(midBorder);
+    lines.push("");
+    lines.push(`--- Execution Logs (last ${this.logLines}) ---`);
 
     if (this.logs.length === 0) {
-      lines.push(`║  ${clr(C.dim, "[--:--:--] INFO  (no logs yet)")}${" ".repeat(Math.max(0, innerWidth - 34))} ║`);
+      lines.push("[--:--:--] INFO  (no logs yet)");
     } else {
-      const logMsgW = Math.max(48, innerWidth - 26);
+      const logMessageWidth = Math.max(48, frameWidth - 24);
       for (const log of this.logs) {
-        const levelColor = log.level === "ERROR" ? C.red
-          : log.level === "WARN"    ? C.yellow
-          : log.level === "INFO"    ? C.cyan
-          : log.level === "SUCCESS" ? C.green
-          : /^A\d+\/\d+$/i.test(log.level) ? C.cyan
-          : C.dim;
-        const levelStr   = clr(levelColor, log.level.padEnd(5));
-        const msgStr     = this.clip(log.message, logMsgW);
-        const rawLine    = `[${log.time}] ${log.level.padEnd(5)} ${msgStr}`;
-        const colorLine  = `[${log.time}] ${levelStr} ${msgStr}`;
-        const padLen     = Math.max(0, innerWidth - 2 - visibleLen(rawLine));
-        lines.push(`║ ${colorLine}${" ".repeat(padLen)} ║`);
+        lines.push(`[${log.time}] ${log.level.padEnd(5)} ${this.clip(log.message, logMessageWidth)}`);
       }
     }
 
-    lines.push(botBorder);
-
-    // Footer
-    const profitFooter = lastProfitabilityStatus
+    lines.push("");
+    const profitLabel = lastProfitabilityStatus
       ? `${lastProfitabilityStatus.modeLabel} ${lastProfitabilityStatus.currentRecoveryPercent}%`
       : "-";
-    lines.push(
-      clr(C.dim, `  Ctrl+C to stop  │  delay ${this.state.minDelay || "?"}s–${this.state.maxDelay || "?"}s  │  cap ${HOURLY_MAX_TX_PER_ACCOUNT}/hr  │  profitability: ${profitFooter}`)
-    );
+    lines.push(`Ctrl+C to stop  |  delay ${this.state.minDelay || "?"}s-${this.state.maxDelay || "?"}s  |  cap ${HOURLY_MAX_TX_PER_ACCOUNT}/hr  |  profitability: ${profitLabel}`);
 
     process.stdout.write(`\x1b[2J\x1b[H${lines.join("\n")}\n`);
   }
@@ -1733,10 +1426,6 @@ function randomIntInclusive(min, max) {
 
 // Triangular distribution: most delays cluster near the center of the range,
 // with occasional shorter/longer values, mimicking human timing patterns.
-function getRandomDelay(min, max) {
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
 function humanLikeDelay(minSec, maxSec) {
   const range = maxSec - minSec;
   if (range <= 0) return Math.round(minSec);
@@ -2484,6 +2173,9 @@ function resolveTierKey(tierDisplayName) {
 
 // Track tier displayName per account (from /api/rewards tierProgress.currentTierDisplayName)
 const tierDisplayNameByAccount = new Map();
+// Track which accounts have had /api/rewards fetched at least once in this run.
+// Used to distinguish "tier not yet fetched" vs "fetched but truly unranked".
+const tierFetchedByAccount = new Set();
 
 function getAccountTierKey(accountName) {
   const displayName = tierDisplayNameByAccount.get(accountName);
@@ -2938,6 +2630,9 @@ function normalizeConfig(rawConfig) {
 
   const sessionInput = isObject(rawConfig.session) ? rawConfig.session : {};
   const session = {
+    // Hardcoded: website migrated from Vercel Security Checkpoint to Cloudflare.
+    // No _vcrcs cookies needed anymore. Browser challenge is permanently skipped.
+    skipVercelChallenge: true,
     preflightOnboard:
       typeof sessionInput.preflightOnboard === "boolean"
         ? sessionInput.preflightOnboard
@@ -3170,10 +2865,32 @@ function normalizeConfig(rawConfig) {
     retryIntervalSeconds: Math.max(10, clampToNonNegativeInt(profitInput.retryIntervalSeconds, 60))
   };
 
-  // Captcha: hanya Multibot — cukup butuh apiKey
   const captchaInput = isObject(rawConfig.captcha) ? rawConfig.captcha : {};
+  const captchaProvider = String(captchaInput.provider || "self-hosted").toLowerCase().trim();
+  const validProviders = ["self-hosted", "2captcha", "multibot", "auto"];
+  const fallbackProviderInput = String(captchaInput.fallbackProvider || "2captcha").toLowerCase().trim();
+  const validFallbackProviders = ["2captcha", "multibot"];
+
+  // solverUrl supports single string or array of strings for load balancing
+  let solverUrls;
+  if (Array.isArray(captchaInput.solverUrl)) {
+    solverUrls = captchaInput.solverUrl
+      .map((u) => String(u || "").trim())
+      .filter(Boolean);
+  } else {
+    const single = String(captchaInput.solverUrl || SELFHOSTED_SOLVER_DEFAULT_URL).trim();
+    solverUrls = single ? [single] : [SELFHOSTED_SOLVER_DEFAULT_URL];
+  }
+  if (solverUrls.length === 0) {
+    solverUrls = [SELFHOSTED_SOLVER_DEFAULT_URL];
+  }
+
   const captcha = {
-    apiKey: String(captchaInput.apiKey || captchaInput.api_key || "").trim()
+    provider: validProviders.includes(captchaProvider) ? captchaProvider : "self-hosted",
+    fallbackProvider: validFallbackProviders.includes(fallbackProviderInput) ? fallbackProviderInput : "2captcha",
+    solverUrl: solverUrls.length === 1 ? solverUrls[0] : solverUrls[0],
+    solverUrls: solverUrls,
+    apiKey: String(captchaInput.apiKey || "").trim()
   };
 
   const tgInput = isObject(rawConfig.telegram) ? rawConfig.telegram : {};
@@ -3595,6 +3312,22 @@ async function solveBrowserChallenge(baseUrl, onboardPath, userAgent, headless =
       console.log(`[browser] 429 detected, using 429 challenge mode (${probeAttempts} checks).`);
     }
 
+    // If page loaded with 200 and no challenge, cookies may already be available
+    // (Cloudflare-proxied sites don't set _vc* cookies anymore)
+    if (status === 200) {
+      const initialCookies = await page.cookies();
+      if (initialCookies.length > 0 || !response) {
+        console.log(`[browser] Page loaded with HTTP 200 — no Vercel challenge detected (${initialCookies.length} cookies). Skipping challenge poll.`);
+        // Return whatever cookies are available
+        const cookieMap = new Map();
+        for (const cookie of initialCookies) {
+          cookieMap.set(cookie.name, cookie.value);
+        }
+        cacheSecurityCookiesFromMap(cookieMap, "browser-no-challenge");
+        return cookieMap;
+      }
+    }
+
     console.log("[browser] Waiting for Vercel challenge to resolve...");
 
     for (let i = 0; i < probeAttempts; i++) {
@@ -3705,132 +3438,26 @@ function isTrafficCongestionError(error) {
 // Backend triggers this when networkRecovery is not "green": /api/send/transfer
 // returns HTTP 403 "Network is congested. A challenge must be ..." unless body
 // carries { acknowledgeTrafficWarning: true, trafficChallengeToken: <token> }.
-// Diselesaikan via Multibot API (api.multibot.cloud) — layanan berbayar.
+//
+// Supported providers (config.captcha.provider):
+//   "self-hosted" — Turnstile-Solver lokal (GRATIS, default)
+//   "2captcha"    — 2Captcha API (berbayar, butuh apiKey)
+//   "multibot"    — Multibot API (berbayar, butuh apiKey)
+//   "auto"        — coba self-hosted dulu, fallback ke remote provider jika gagal
 // ============================================================================
 const TURNSTILE_SITEKEY = "0x4AAAAAAC-oOGMu5lxFvc7w";
 const TURNSTILE_PAGEURL = "https://bridge.rootsfi.com/send";
-
-// ============================================================================
-// CAPTCHA: Multibot-only Turnstile solver
-// Provider: Multibot (https://multibot.in)
-// Protocol: GET /in.php?key=...&method=turnstile&... → GET /res.php?key=...&id=...
-// Config.json: { "captcha": { "apiKey": "YOUR_MULTIBOT_API_KEY" } }
-// ============================================================================
-
-const MULTIBOT_IN_URL  = "https://api.multibot.cloud/in.php";
+const TWOCAPTCHA_IN_URL = "https://2captcha.com/in.php";
+const TWOCAPTCHA_RES_URL = "https://2captcha.com/res.php";
+const MULTIBOT_IN_URL = "https://api.multibot.cloud/in.php";
 const MULTIBOT_RES_URL = "https://api.multibot.cloud/res.php";
-const MULTIBOT_POLL_INTERVAL_MS  = 5000;   // interval polling hasil (5 detik)
-const MULTIBOT_POLL_TIMEOUT_MS   = 180000; // max tunggu token (3 menit)
-const MULTIBOT_INITIAL_WAIT_MS   = 10000;  // tunggu awal sebelum poll pertama (10 detik)
-
-/**
- * Parse response teks dari Multibot API.
- * Format: "OK|<value>" atau "CAPCHA_NOT_READY" atau JSON {status, request}
- */
-function parseMultibotResponse(responseText) {
-  const text = String(responseText || "").trim();
-  if (!text) return { status: "error", value: "empty response" };
-
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object") {
-      if (Number(parsed.status) === 1) {
-        return { status: "ok", value: String(parsed.request || "").trim() };
-      }
-      const req = String(parsed.request || "").trim();
-      if (req === "CAPCHA_NOT_READY") return { status: "pending", value: req };
-      return { status: "error", value: req || text.slice(0, 200) };
-    }
-  } catch {}
-
-  if (text === "CAPCHA_NOT_READY") return { status: "pending", value: text };
-  if (text.startsWith("OK|"))      return { status: "ok",      value: text.slice(3).trim() };
-  return { status: "error", value: text.slice(0, 200) };
-}
-
-/**
- * Solve Cloudflare Turnstile menggunakan Multibot API.
- * Dipanggil langsung oleh solveTurnstileWithFallback (pengganti nama lama).
- */
-async function solveTurnstileWithFallback(config, sitekey, url) {
-  const apiKey = String(config && config.captcha && config.captcha.apiKey || "").trim();
-
-  if (!apiKey) {
-    throw new Error(
-      "[captcha] config.captcha.apiKey kosong! " +
-      "Daftarkan akun di https://multibot.in dan isi API key di config.json"
-    );
-  }
-
-  const effectiveSitekey = sitekey || TURNSTILE_SITEKEY;
-  const effectiveUrl     = url     || TURNSTILE_PAGEURL;
-
-  const fetchFn = (typeof globalThis.fetch === "function")
-    ? globalThis.fetch.bind(globalThis)
-    : null;
-  if (!fetchFn) throw new Error("global fetch tidak tersedia (butuh Node.js 18+)");
-
-  // STEP 1: Submit task ke Multibot
-  const submitUrl =
-    `${MULTIBOT_IN_URL}` +
-    `?key=${encodeURIComponent(apiKey)}` +
-    `&method=turnstile` +
-    `&sitekey=${encodeURIComponent(effectiveSitekey)}` +
-    `&pageurl=${encodeURIComponent(effectiveUrl)}` +
-    `&json=1`;
-
-  console.log("[captcha] Submitting Turnstile task ke Multibot...");
-  const submitResp = await fetchFn(submitUrl, { method: "GET" });
-  const submitText = await submitResp.text();
-  const submitResult = parseMultibotResponse(submitText);
-
-  if (submitResult.status !== "ok" || !submitResult.value) {
-    throw new Error(`[captcha] Multibot submit error: ${submitResult.value || submitText.slice(0, 200)}`);
-  }
-
-  const captchaId = submitResult.value;
-  console.log(`[captcha] Multibot task submitted (id=${captchaId}). Menunggu hasil...`);
-
-  // Tunggu sebentar sebelum poll pertama
-  await new Promise(r => setTimeout(r, MULTIBOT_INITIAL_WAIT_MS));
-
-  // STEP 2: Poll hasil sampai dapat token atau timeout
-  const deadline = Date.now() + MULTIBOT_POLL_TIMEOUT_MS;
-
-  while (Date.now() < deadline) {
-    const pollUrl =
-      `${MULTIBOT_RES_URL}` +
-      `?key=${encodeURIComponent(apiKey)}` +
-      `&action=get` +
-      `&id=${encodeURIComponent(captchaId)}` +
-      `&json=1`;
-
-    const pollResp   = await fetchFn(pollUrl, { method: "GET" });
-    const pollText   = await pollResp.text();
-    const pollResult = parseMultibotResponse(pollText);
-
-    if (pollResult.status === "ok") {
-      const token = String(pollResult.value || "").trim();
-      if (!token) throw new Error("[captcha] Multibot mengembalikan token kosong");
-      console.log(`[captcha] Turnstile token diterima dari Multibot (len=${token.length})`);
-      return token;
-    }
-
-    if (pollResult.status === "pending") {
-      // Masih dalam proses — lanjut poll
-      await new Promise(r => setTimeout(r, MULTIBOT_POLL_INTERVAL_MS));
-      continue;
-    }
-
-    // status === "error"
-    throw new Error(`[captcha] Multibot res.php error: ${pollResult.value || pollText.slice(0, 200)}`);
-  }
-
-  throw new Error(
-    `[captcha] Multibot timeout setelah ${MULTIBOT_POLL_TIMEOUT_MS / 1000}s ` +
-    `menunggu token Turnstile`
-  );
-}
+const TWOCAPTCHA_POLL_INTERVAL_MS = 5000;
+const TWOCAPTCHA_POLL_TIMEOUT_MS = 180000;
+const TWOCAPTCHA_INITIAL_WAIT_MS = 10000;
+const SELFHOSTED_SOLVER_DEFAULT_URL = "http://localhost:8000";
+let _solverRoundRobinIndex = 0; // round-robin counter for multi-solver load balancing
+const SELFHOSTED_POLL_INTERVAL_MS = 2000;
+const SELFHOSTED_POLL_TIMEOUT_MS = 180000;
 
 function isTrafficChallengeRequiredError(error) {
   if (!error) return false;
@@ -3845,6 +3472,293 @@ function isTrafficChallengeRequiredError(error) {
   );
 }
 
+async function solveTurnstileVia2Captcha(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  return solveTurnstileViaRemoteCaptcha("2captcha", apiKey, { sitekey, pageurl });
+}
+
+async function solveTurnstileViaMultibot(apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  return solveTurnstileViaRemoteCaptcha("multibot", apiKey, { sitekey, pageurl });
+}
+
+function resolveRemoteCaptchaProvider(providerName) {
+  const normalized = String(providerName || "").toLowerCase().trim();
+  if (normalized === "2captcha") {
+    return {
+      name: "2captcha",
+      label: "2Captcha",
+      inUrl: TWOCAPTCHA_IN_URL,
+      resUrl: TWOCAPTCHA_RES_URL
+    };
+  }
+  if (normalized === "multibot") {
+    return {
+      name: "multibot",
+      label: "Multibot",
+      inUrl: MULTIBOT_IN_URL,
+      resUrl: MULTIBOT_RES_URL
+    };
+  }
+  throw new Error(`Unknown remote captcha provider: ${providerName}`);
+}
+
+function parseRemoteCaptchaResponse(responseText) {
+  const text = String(responseText || "").trim();
+  if (!text) {
+    return { status: "error", value: "empty response" };
+  }
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "status")) {
+      if (Number(parsed.status) === 1) {
+        return { status: "ok", value: String(parsed.request || "").trim() };
+      }
+      const request = String(parsed.request || "").trim();
+      if (request === "CAPCHA_NOT_READY") {
+        return { status: "pending", value: request };
+      }
+      return { status: "error", value: request || text.slice(0, 200) };
+    }
+  } catch {}
+
+  if (text === "CAPCHA_NOT_READY") {
+    return { status: "pending", value: text };
+  }
+  if (text.startsWith("OK|")) {
+    return { status: "ok", value: text.slice(3).trim() };
+  }
+  return { status: "error", value: text.slice(0, 200) };
+}
+
+async function solveTurnstileViaRemoteCaptcha(providerName, apiKey, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  const provider = resolveRemoteCaptchaProvider(providerName);
+  if (!apiKey) {
+    throw new Error(`${provider.label} API key missing (config.captcha.apiKey)`);
+  }
+
+  const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
+  if (!fetchFn) {
+    throw new Error("global fetch is not available in this Node runtime");
+  }
+
+  const submitUrl = `${provider.inUrl}?key=${encodeURIComponent(apiKey)}`
+    + `&method=turnstile&sitekey=${encodeURIComponent(sitekey)}`
+    + `&pageurl=${encodeURIComponent(pageurl)}`;
+  const submitResp = await fetchFn(submitUrl, { method: "GET" });
+  const submitText = await submitResp.text();
+  const submitResult = parseRemoteCaptchaResponse(submitText);
+  if (submitResult.status !== "ok" || !submitResult.value) {
+    throw new Error(`${provider.label} in.php error: ${submitResult.value || submitText.slice(0, 200)}`);
+  }
+
+  const captchaId = submitResult.value;
+  console.log(`[captcha] ${provider.label} task submitted (id=${captchaId}). Waiting for solve...`);
+  await sleep(TWOCAPTCHA_INITIAL_WAIT_MS);
+
+  const deadline = Date.now() + TWOCAPTCHA_POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const pollUrl = `${provider.resUrl}?key=${encodeURIComponent(apiKey)}`
+      + `&action=get&id=${encodeURIComponent(captchaId)}`;
+    const pollResp = await fetchFn(pollUrl, { method: "GET" });
+    const pollText = await pollResp.text();
+    const pollResult = parseRemoteCaptchaResponse(pollText);
+
+    if (pollResult.status === "ok") {
+      const token = String(pollResult.value || "").trim();
+      if (!token) {
+        throw new Error(`${provider.label} returned empty token`);
+      }
+      console.log(`[captcha] Turnstile token received via ${provider.label} (len=${token.length}).`);
+      return token;
+    }
+
+    if (pollResult.status === "pending") {
+      await sleep(TWOCAPTCHA_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    throw new Error(`${provider.label} res.php error: ${pollResult.value || pollText.slice(0, 200)}`);
+  }
+
+  throw new Error(`${provider.label} timed out after ${TWOCAPTCHA_POLL_TIMEOUT_MS / 1000}s waiting for Turnstile token`);
+}
+
+/**
+ * Solve Cloudflare Turnstile via self-hosted Turnstile-Solver (GRATIS).
+ * Solver harus sudah jalan di VPS: python3 api_server.py (default port 8000).
+ * Flow: POST /turnstile -> poll GET /result?id=<task_id> sampai success/error.
+ */
+async function solveTurnstileViaSelfHosted(solverBaseUrl, { sitekey = TURNSTILE_SITEKEY, pageurl = TURNSTILE_PAGEURL } = {}) {
+  const baseUrl = String(solverBaseUrl || SELFHOSTED_SOLVER_DEFAULT_URL).replace(/\/+$/, "");
+
+  const fetchFn = (typeof globalThis.fetch === "function") ? globalThis.fetch.bind(globalThis) : null;
+  if (!fetchFn) {
+    throw new Error("global fetch is not available in this Node runtime");
+  }
+
+  // Step 1: Submit task to self-hosted solver
+  const submitUrl = `${baseUrl}/turnstile?url=${encodeURIComponent(pageurl)}&sitekey=${encodeURIComponent(sitekey)}`;
+  let submitResp;
+  try {
+    submitResp = await fetchFn(submitUrl, { method: "GET", signal: AbortSignal.timeout(15000) });
+  } catch (connError) {
+    const connMsg = String(connError && connError.message ? connError.message : connError || "");
+    throw new Error(`Self-hosted solver tidak bisa dihubungi di ${baseUrl}: ${connMsg}`);
+  }
+
+  if (submitResp.status === 429) {
+    throw new Error("Self-hosted solver penuh (429), semua worker sedang sibuk. Coba lagi nanti.");
+  }
+
+  const submitText = await submitResp.text();
+  let submitJson;
+  try {
+    submitJson = JSON.parse(submitText);
+  } catch {
+    throw new Error(`Self-hosted solver returned non-JSON: ${submitText.slice(0, 200)}`);
+  }
+
+  if (!submitJson || submitJson.status !== "accepted") {
+    const errDetail = submitJson && submitJson.error ? submitJson.error : submitText.slice(0, 200);
+    throw new Error(`Self-hosted solver submit error: ${errDetail}`);
+  }
+
+  const taskId = String(submitJson.task_id || "").trim();
+  if (!taskId) {
+    throw new Error("Self-hosted solver returned empty task_id");
+  }
+
+  console.log(`[captcha] Self-hosted solver task submitted (id=${taskId.slice(0, 12)}...). Polling...`);
+
+  // Step 2: Poll for result
+  const deadline = Date.now() + SELFHOSTED_POLL_TIMEOUT_MS;
+  let pollCount = 0;
+  while (Date.now() < deadline) {
+    await sleep(SELFHOSTED_POLL_INTERVAL_MS);
+    pollCount += 1;
+
+    const pollUrl = `${baseUrl}/result?id=${encodeURIComponent(taskId)}`;
+    let pollResp;
+    try {
+      pollResp = await fetchFn(pollUrl, { method: "GET", signal: AbortSignal.timeout(10000) });
+    } catch (pollConnError) {
+      console.log(`[captcha] Self-hosted solver poll #${pollCount} connection error: ${pollConnError.message}. Retrying...`);
+      continue;
+    }
+
+    // 404 = task expired or not found
+    if (pollResp.status === 404) {
+      throw new Error(`Self-hosted solver task ${taskId.slice(0, 12)} expired atau tidak ditemukan (404)`);
+    }
+
+    const pollText = await pollResp.text();
+    let pollJson;
+    try {
+      pollJson = JSON.parse(pollText);
+    } catch {
+      console.log(`[captcha] Self-hosted solver poll #${pollCount} parse error: ${pollText.slice(0, 100)}. Retrying...`);
+      continue;
+    }
+
+    if (pollJson.status === "success") {
+      const token = String(pollJson.value || "").trim();
+      if (!token) {
+        throw new Error("Self-hosted solver returned empty token");
+      }
+      console.log(`[captcha] Turnstile token received via self-hosted solver (len=${token.length}, ${pollCount} polls).`);
+      return token;
+    }
+
+    if (pollJson.status === "error") {
+      const errValue = String(pollJson.value || pollJson.message || "unknown");
+      throw new Error(`Self-hosted solver error: ${errValue}`);
+    }
+
+    // status === "process" -> masih solving, lanjut poll
+    if (pollCount % 10 === 0) {
+      console.log(`[captcha] Self-hosted solver masih solving... (poll #${pollCount})`);
+    }
+  }
+
+  throw new Error(`Self-hosted solver timed out after ${SELFHOSTED_POLL_TIMEOUT_MS / 1000}s (${pollCount} polls)`);
+}
+
+/**
+ * Smart captcha solver wrapper — auto-selects provider based on config.
+ * Supports multiple solver URLs with round-robin load balancing.
+ * Provider options: "self-hosted" (default, gratis), "2captcha", "multibot", "auto".
+ */
+async function solveTurnstile(captchaConfig) {
+  const provider = String(captchaConfig && captchaConfig.provider || "self-hosted").toLowerCase().trim();
+  const solverUrls = Array.isArray(captchaConfig && captchaConfig.solverUrls) && captchaConfig.solverUrls.length > 0
+    ? captchaConfig.solverUrls
+    : [String(captchaConfig && captchaConfig.solverUrl || SELFHOSTED_SOLVER_DEFAULT_URL).trim()];
+  const apiKey = String(captchaConfig && captchaConfig.apiKey || "").trim();
+  const fallbackProvider = String(captchaConfig && captchaConfig.fallbackProvider || "2captcha").toLowerCase().trim();
+
+  if (provider === "2captcha" || provider === "multibot") {
+    const remoteProvider = resolveRemoteCaptchaProvider(provider);
+    if (!apiKey) {
+      throw new Error(`Provider ${provider} dipilih tapi config.captcha.apiKey kosong!`);
+    }
+    console.log(`[captcha] Solving Turnstile via ${remoteProvider.label} (berbayar)...`);
+    return provider === "multibot"
+      ? solveTurnstileViaMultibot(apiKey)
+      : solveTurnstileVia2Captcha(apiKey);
+  }
+
+  if (provider === "self-hosted") {
+    // Round-robin across multiple solver URLs
+    const errors = [];
+    for (let i = 0; i < solverUrls.length; i++) {
+      const idx = (_solverRoundRobinIndex + i) % solverUrls.length;
+      const url = solverUrls[idx];
+      try {
+        console.log(`[captcha] Solving via self-hosted solver [${idx + 1}/${solverUrls.length}] (${url})...`);
+        const token = await solveTurnstileViaSelfHosted(url);
+        _solverRoundRobinIndex = (idx + 1) % solverUrls.length;
+        return token;
+      } catch (err) {
+        console.log(`[captcha] Solver [${idx + 1}] (${url}) gagal: ${err.message}`);
+        errors.push({ url, error: err });
+      }
+    }
+    // All solvers failed
+    const lastErr = errors.length > 0 ? errors[errors.length - 1].error : new Error("No solver URLs configured");
+    throw lastErr;
+  }
+
+  if (provider === "auto") {
+    // Coba semua self-hosted dulu (round-robin), fallback ke remote provider
+    const errors = [];
+    for (let i = 0; i < solverUrls.length; i++) {
+      const idx = (_solverRoundRobinIndex + i) % solverUrls.length;
+      const url = solverUrls[idx];
+      try {
+        console.log(`[captcha] [auto] Mencoba solver [${idx + 1}/${solverUrls.length}] (${url})...`);
+        const token = await solveTurnstileViaSelfHosted(url);
+        _solverRoundRobinIndex = (idx + 1) % solverUrls.length;
+        return token;
+      } catch (err) {
+        console.log(`[captcha] [auto] Solver [${idx + 1}] (${url}) gagal: ${err.message}`);
+        errors.push({ url, error: err });
+      }
+    }
+    // All self-hosted failed, try configured remote fallback
+    if (apiKey) {
+      const remoteProvider = resolveRemoteCaptchaProvider(fallbackProvider);
+      console.log(`[captcha] [auto] Semua self-hosted gagal. Fallback ke ${remoteProvider.label}...`);
+      return fallbackProvider === "multibot"
+        ? solveTurnstileViaMultibot(apiKey)
+        : solveTurnstileVia2Captcha(apiKey);
+    }
+    console.log("[captcha] [auto] Semua solver gagal, tidak ada fallback remote provider.");
+    const lastErr = errors.length > 0 ? errors[errors.length - 1].error : new Error("No solver URLs configured");
+    throw lastErr;
+  }
+
+  throw new Error(`Provider captcha tidak dikenal: "${provider}". Gunakan: "self-hosted", "2captcha", "multibot", atau "auto".`);
+}
 
 let lastProfitabilityStatus = null;
 
@@ -4988,7 +4902,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
   }
   let challengeToken = null;
   try {
-    challengeToken = await solveTurnstileWithFallback(config, TURNSTILE_SITEKEY, TURNSTILE_PAGEURL);
+    challengeToken = await solveTurnstile(config.captcha);
     stepLog(`[captcha] Token siap, lanjut transfer dengan trafficChallengeToken.`);
     if (dashboard) {
       dashboard.setState({
@@ -5052,7 +4966,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
         // Always discard old token; Turnstile tokens are single-use.
         challengeToken = null;
         try {
-          challengeToken = await solveTurnstileWithFallback(config, TURNSTILE_SITEKEY, TURNSTILE_PAGEURL);
+          challengeToken = await solveTurnstile(config.captcha);
         } catch (solveError) {
           stepLog(`[captcha] Gagal solve Turnstile: ${solveError.message}`);
           throw solveError;
@@ -5102,17 +5016,11 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
     ? String(transferData.command_result.transfer.updateId || "").trim()
     : "";
 
-  if (!transferId) {
-    const err = new Error(
-      `Transfer CC response missing id for ${sendRequest.label} — treating as failed submit (will retry).`
+  if (transferId) {
+    console.log(
+      `[info] Transfer submitted: id=${transferId}${transferUpdateId ? ` updateId=${transferUpdateId}` : ""}`
     );
-    err.isMissingTransferId = true;
-    throw err;
   }
-
-  console.log(
-    `[info] Transfer submitted: id=${transferId}${transferUpdateId ? ` updateId=${transferUpdateId}` : ""}`
-  );
 
   // Step 6: Check outgoing (optional, non-fatal)
   try {
@@ -5131,7 +5039,7 @@ async function executeCcSendFlow(client, sendRequest, config, onCheckpointRefres
 
   return {
     transferId,
-    status: "submitted",
+    status: transferId ? "submitted" : "unknown",
     amount: String(sendRequest.amount),
     recipient: String(sendRequest.label)
   };
@@ -5367,6 +5275,11 @@ async function refreshThisWeekRewardDashboard(client, dashboard, accountLogTag =
 
     // Extract tier min qualifying send amount + quality score
     const data = isObject(rewardsResponse && rewardsResponse.data) ? rewardsResponse.data : {};
+    if (accountName) {
+      // Mark tier fetch as completed for this account (even if truly unranked
+      // with no displayName, so the send-guard can proceed).
+      tierFetchedByAccount.add(accountName);
+    }
     if (isObject(data.tierProgress) && accountName) {
       const tierMin = Number(data.tierProgress.currentTier && data.tierProgress.currentTier.minCcWholeTokensPerQualifyingSend);
       const tierDisplayName = String(data.tierProgress.currentTierDisplayName || "").trim();
@@ -5854,8 +5767,8 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
         retryAttempt += 1;
         const transientSendError = isTransientSendFlowError(error);
         const retryDelaySeconds = transientSendError
-          ? Math.min(30, 6 + ((retryAttempt - 1) * 8)) + getRandomDelay(2, 8)
-          : TX_RETRY_INITIAL_DELAY_SECONDS + ((retryAttempt - 1) * TX_RETRY_DELAY_STEP_SECONDS) + getRandomDelay(5, 20);
+          ? Math.min(30, 6 + ((retryAttempt - 1) * 8))
+          : TX_RETRY_INITIAL_DELAY_SECONDS + ((retryAttempt - 1) * TX_RETRY_DELAY_STEP_SECONDS);
         const errorMessage = String(error && error.message ? error.message : error);
 
         if (retryAttempt >= MAX_SEND_FLOW_RETRY_ATTEMPTS) {
@@ -6086,6 +5999,17 @@ async function executeSendBatch(client, sendRequests, config, dashboard, onCheck
 }
 
 async function refreshVercelSecurityCookies(client, config, reasonLabel, onCheckpointRefresh) {
+  // Skip browser challenge entirely if website no longer uses Vercel Security Checkpoint
+  if (true /* skipVercelChallenge: website migrated to Cloudflare */) {
+    console.log(`[info] ${reasonLabel} — SKIPPED (skipVercelChallenge=true, website uses Cloudflare now)`);
+    return {
+      refreshed: true,
+      unavailable: false,
+      retryAfterSeconds: 0,
+      reason: "skipped-no-vercel-challenge"
+    };
+  }
+
   console.log(`[info] ${reasonLabel}`);
   const hadSecurityCookie = client.hasSecurityCookie();
   const hadSessionCookie = client.hasAccountSessionCookie();
@@ -6308,14 +6232,6 @@ async function attemptSessionReuse(client, config, onCheckpointRefresh, accountL
             `[warn] Session reuse fetch/network failure detected (possible 429 rate limit). ` +
             `Will retry with extended backoff instead of immediate restart.`
           );
-          if (!client._failCount) client._failCount = 0;
-          client._failCount++;
-          const _backoffBase = 30;
-          const _backoffMax = 180;
-          const _backoff = Math.min(_backoffBase * Math.pow(1.5, client._failCount), _backoffMax);
-          const _jitter = getRandomDelay(5, 20);
-          logSession(`[backoff] _failCount=${client._failCount} backoff=${Math.round(_backoff)}s jitter=${_jitter}s`);
-          await sleep((_backoff + _jitter) * 1000);
         }
 
         transientFailureCount += 1;
@@ -6771,10 +6687,11 @@ async function processAccount(context) {
     const buildSendRequestsNow = () => {
       const senderTierKey = getAccountTierKey(account.name);
 
-      // Guard: jangan kirim kalau tier belum diketahui (masih fallback "unranked")
-      // karena amount bisa salah (terlalu kecil = tidak qualify, atau tidak sesuai rules)
-      if (senderTierKey === "unranked" && !tierDisplayNameByAccount.has(account.name)) {
-        console.log(withAccountTag(accountLogTag, `[warn] Tier belum diketahui, defer send sampai tier ter-fetch`));
+      // Guard: defer ONLY if /api/rewards belum pernah berhasil di-fetch untuk akun ini.
+      // Kalau sudah fetched tapi tetap unranked (akun baru / belum ada qualifying send),
+      // tetap lanjut TX pakai amount range "unranked" dari config.
+      if (!tierFetchedByAccount.has(account.name)) {
+        console.log(withAccountTag(accountLogTag, `[warn] Tier belum di-fetch, defer send sampai /api/rewards sukses`));
         buildDeferResult = {
           success: true,
           account: account.name,
@@ -6922,7 +6839,8 @@ async function processAccount(context) {
       }
     }
 
-    if (shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
+    // skipVercelChallenge: website migrated to Cloudflare, proactive refresh permanently disabled
+    if (false && shouldRefreshVercelCookie(lastVercelRefreshAt, accountConfig.session.proactiveVercelRefreshMinutes)) {
       dashboard.setState({ phase: "vercel-refresh" });
       console.log(
         withAccountTag(
@@ -6945,17 +6863,24 @@ async function processAccount(context) {
     }
 
     if (!client.hasValidSession()) {
-      dashboard.setState({ phase: "browser-checkpoint" });
-      console.log("[info] No valid session cookies found, launching browser...");
-      await refreshVercelSecurityCookies(
-        client,
-        accountConfig,
-        "Initial browser verification required",
-        markCheckpointRefresh
-      );
-      console.log("[info] Browser cookies merged from challenge flow");
-      client.logCookieStatus("after browser merge");
-      updateCookieDashboard(client);
+      if (true /* skipVercelChallenge: Cloudflare */) {
+        // Website no longer uses Vercel checkpoint — skip browser challenge.
+        // Session will be established via OTP or session reuse without _vcrcs.
+        console.log("[info] No valid session cookies found — Vercel challenge skipped (website uses Cloudflare)");
+        console.log("[info] Will proceed to session reuse or OTP flow directly.");
+      } else {
+        dashboard.setState({ phase: "browser-checkpoint" });
+        console.log("[info] No valid session cookies found, launching browser...");
+        await refreshVercelSecurityCookies(
+          client,
+          accountConfig,
+          "Initial browser verification required",
+          markCheckpointRefresh
+        );
+        console.log("[info] Browser cookies merged from challenge flow");
+        client.logCookieStatus("after browser merge");
+        updateCookieDashboard(client);
+      }
     } else {
       console.log("[info] Using existing session cookies from tokens.json");
     }
@@ -7852,6 +7777,55 @@ async function runDailyCycle(context) {
   console.log(`[cycle] Profitability gate: allowedModes=${(config.profitability.allowedModes || []).join("/")} | retryInterval=${config.profitability.retryIntervalSeconds}s`);
   console.log(`${"#".repeat(70)}\n`);
 
+  // Balance-only fast path: login + print balance per account, no scheduler/TX.
+  if (sendMode === "balance-only") {
+    const boResults = [];
+    const boSnapshots = {};
+    for (let i = 0; i < sortedAccounts.length; i++) {
+      const account = sortedAccounts[i];
+      const accountToken = tokens.accounts[account.name] || normalizeTokenProfile({});
+      tokens.accounts[account.name] = accountToken;
+      try {
+        const result = await processAccount({
+          account,
+          accountToken,
+          config,
+          tokens,
+          tokensPath,
+          sendMode,
+          recipientsInfo,
+          args,
+          accountIndex: i,
+          totalAccounts: sortedAccounts.length,
+          selectedAccounts: sortedAccounts,
+          accountSnapshots: boSnapshots,
+          loopRound: 1,
+          totalLoopRounds: 1,
+          maxLoopTxOverride: 0,
+          smartFillBlockRecipients: [],
+          resumeFromDeferReason: "",
+          preferRecipientNames: []
+        });
+        boResults.push(result);
+      } catch (error) {
+        console.error(`[error] ${account.name}: ${error.message}`);
+        boResults.push({ success: false, account: account.name, error: error.message });
+      }
+    }
+    if (!args.dryRun) {
+      try { await saveTokensSerial(tokensPath, tokens); } catch (err) {
+        console.warn(`[warn] Failed to persist tokens: ${err.message}`);
+      }
+    }
+    const cycleEndTime = new Date();
+    return {
+      results: boResults,
+      successful: boResults.filter((r) => r && r.success && !r.deferred),
+      failed: boResults.filter((r) => r && !r.success),
+      cycleDuration: cycleEndTime - cycleStartTime
+    };
+  }
+
   const results = [];
   const accountSnapshots = {};
   const inFlight = new Set();
@@ -8031,13 +8005,11 @@ async function runDailyCycle(context) {
     results.push(resultRecord);
 
     if (success) {
-      if (account._failCount) account._failCount = 0;
       completedByAccount.set(
         accountName,
         (completedByAccount.get(accountName) || 0) + 1
       );
       recordTxTimestamp(accountName);
-      await saveTxHourlyState();
 
       // Next-available: humanLikeDelay window + safety buffer.
       // If hourly cap reached, push to oldest+1h (clamp by hourly waiter).
@@ -8163,7 +8135,6 @@ async function runDailyCycle(context) {
 
     for (const acc of toLaunch) {
       runOne(acc); // fire and forget — tracked via inFlight + nextAvailableAt
-      await sleep(getRandomDelay(2, 6) * 1000);
     }
 
     // Deadlock detection: if every remaining account is skipping due to low
@@ -8241,13 +8212,17 @@ async function runOtpOnlyFlow(context) {
     const client = new RootsFiApiClient(accountConfig);
 
     try {
-      console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
-      await refreshVercelSecurityCookies(
-        client,
-        accountConfig,
-        `OTP-mode fresh browser challenge (${account.name})`,
-        markCheckpointRefresh
-      );
+      if (true /* skipVercelChallenge: Cloudflare */) {
+        console.log(`[step] ${tag}: Browser challenge skipped (website uses Cloudflare)`);
+      } else {
+        console.log(`[step] ${tag}: Browser challenge (ambil _vcrcs)`);
+        await refreshVercelSecurityCookies(
+          client,
+          accountConfig,
+          `OTP-mode fresh browser challenge (${account.name})`,
+          markCheckpointRefresh
+        );
+      }
 
       console.log(`[step] ${tag}: Send OTP ke ${maskEmail(selectedEmail)}`);
       const sendOtpResponse = await sendOtpWithCheckpointRecovery(
@@ -8474,7 +8449,6 @@ async function run() {
   };
 
   // Daily loop
-  await loadTxHourlyState();
   let cycleCount = 0;
   const maxConsecutiveErrors = 3;
   let consecutiveErrors = 0;
