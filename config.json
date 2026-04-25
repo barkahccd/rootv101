@@ -60,9 +60,9 @@
     "retryIntervalSeconds": 60
   },
   "captcha": {
-    "provider": "multibot",
+    "provider": "2captcha",
     "solverUrl": "",
-    "apiKey": ""
+    "apiKey": "KEYMULTIBOT"
   },
   "telegram": {
     "enabled": true,
